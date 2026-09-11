@@ -23,6 +23,9 @@ import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.common.metadata.BrokerRegistrationChangeRecord;
 import org.apache.kafka.common.metadata.ConfigRecord;
 import org.apache.kafka.common.metadata.FeatureLevelRecord;
+import org.apache.kafka.common.metadata.NoOpRecord;
+import org.apache.kafka.common.metadata.PartitionChangeRecord;
+import org.apache.kafka.common.metadata.PartitionRecord;
 import org.apache.kafka.common.metadata.RegisterBrokerRecord;
 import org.apache.kafka.common.metadata.TopicRecord;
 import org.apache.kafka.common.utils.MockTime;
@@ -45,6 +48,7 @@ import org.apache.kafka.image.loader.SnapshotManifest;
 import org.apache.kafka.metadata.BrokerRegistrationFencingChange;
 import org.apache.kafka.metadata.BrokerRegistrationInControlledShutdownChange;
 import org.apache.kafka.metadata.KafkaConfigSchema;
+import org.apache.kafka.metadata.PartitionRegistration;
 import org.apache.kafka.metadata.RecordTestUtils;
 import org.apache.kafka.raft.LeaderAndEpoch;
 import org.apache.kafka.raft.OffsetAndEpoch;
@@ -72,9 +76,11 @@ import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
@@ -94,9 +100,16 @@ public class KRaftMigrationDriverTest {
 
     static class MockControllerMetrics extends QuorumControllerMetrics {
         final AtomicBoolean closed = new AtomicBoolean(false);
+        final AtomicLong dualWriteOffset = new AtomicLong(0);
 
         MockControllerMetrics() {
             super(Optional.empty(), Time.SYSTEM, false);
+        }
+
+        @Override
+        public void updateDualWriteOffset(long offset) {
+            super.updateDualWriteOffset(offset);
+            dualWriteOffset.set(offset);
         }
 
         @Override
@@ -444,6 +457,330 @@ public class KRaftMigrationDriverTest {
 
             Assertions.assertNull(faultHandler.firstException());
         }
+    }
+
+    /**
+     * Reproduces an incident where a write to the /migration znode succeeds in ZK, but the driver
+     * never learns its cached version has become stale (i.e. the acknowledgment was lost).
+     * Since {@code applyMigrationOperation} only replaces the cached {@link ZkMigrationLeadershipState}
+     * on a successful write, every subsequent write keeps reusing the same stale version and keeps getting
+     * rejected.
+     * <p>
+     * As a result, three things that should agree start to diverge, and keep diverging further
+     * with every subsequent change: what KRaft's own metadata log says (always current), what is
+     * actually persisted in ZK's own znodes (frozen once a write depending on the stale version
+     * fails), and what a ZK-mode broker was actually told via RPC (also frozen, and for the same
+     * reason as the RPC only fires after a successful write).
+     * <p>
+     * The test walks through this in four stages: a healthy baseline, a no-op delta that fails
+     * only when we try to update the migration state znode (silently, never escalated to the fault handler),
+     * and two separate leadership changes whose own content writes also fail (this time escalated),
+     * proving the driver reuses the exact same cached state and reports the exact same rejection
+     * both times. This will then continue indefinitely for the lifetime of the driver and KRaft and ZK will
+     * continue to diverge.
+     */
+    @Test
+    public void testKRaftAndZkBrokerStateDivergeWhenMigrationVersionChecksFail() throws Exception {
+        CountingMetadataPropagator metadataPropagator = new CountingMetadataPropagator();
+        AtomicInteger actualMigrationZkVersion = new AtomicInteger(0);
+        Map<String, Integer> zkPartitionLeaders = new HashMap<>();
+        List<ZkMigrationLeadershipState> capturedStatesAtLeaderChangeAttempts = new ArrayList<>();
+        CapturingTopicMigrationClient topicClient = newVersionCheckingTopicClient(
+                actualMigrationZkVersion, zkPartitionLeaders, capturedStatesAtLeaderChangeAttempts);
+        CapturingMigrationClient migrationClient = newVersionCheckingMigrationClient(topicClient, actualMigrationZkVersion);
+
+        MockFaultHandler faultHandler = new MockFaultHandler("testKRaftAndZkBrokerStateDivergeWhenMigrationVersionChecksFail");
+        KRaftMigrationDriver.Builder builder = defaultTestBuilder()
+                .setPropagator(metadataPropagator)
+                .setZkMigrationClient(migrationClient)
+                .setFaultHandler(faultHandler)
+                .setInitialZkLoadHandler(metadataPublisher -> { });
+
+        try (KRaftMigrationDriver driver = builder.build()) {
+            // Setup: migrate a topic/partition to DUAL_WRITE with broker 1 as leader
+            MetadataImage image = MetadataImage.EMPTY;
+            MetadataDelta delta = new MetadataDelta(image);
+            setupDeltaForMigration(delta, true);
+
+            startAndWaitForRecoveringMigrationStateFromZK(driver);
+
+            delta.replay(ZkMigrationState.PRE_MIGRATION.toRecord().message());
+            delta.replay(zkBrokerRecord(1));
+            delta.replay(zkBrokerRecord(2));
+            delta.replay(zkBrokerRecord(3));
+            Uuid topicId = Uuid.randomUuid();
+            delta.replay(new TopicRecord().setName("test-topic").setTopicId(topicId));
+            delta.replay(new PartitionRecord()
+                    .setPartitionId(0)
+                    .setTopicId(topicId)
+                    .setReplicas(Arrays.asList(1, 2, 3))
+                    .setIsr(Arrays.asList(1, 2, 3))
+                    .setLeader(1)
+                    .setLeaderEpoch(0)
+                    .setPartitionEpoch(0));
+            MetadataProvenance provenance = new MetadataProvenance(100, 1, 1);
+            image = delta.apply(provenance);
+
+            LeaderAndEpoch newLeader = new LeaderAndEpoch(OptionalInt.of(3000), 1);
+            driver.onControllerChange(newLeader);
+            driver.onMetadataUpdate(delta, image, logDeltaManifestBuilder(provenance, newLeader).build());
+
+            TestUtils.waitForCondition(() -> driver.migrationState().get(1, TimeUnit.MINUTES).equals(MigrationDriverState.DUAL_WRITE),
+                    "Waiting for KRaftMigrationDriver to enter DUAL_WRITE state");
+
+            // Healthy baseline: KRaft, ZK, and brokers all agree broker 1 leads.
+            assertEquals(1, metadataPropagator.images);
+            assertEquals(0, metadataPropagator.deltas);
+            assertEquals(1, image.topics().getTopic(topicId).partitions().get(0).leader);
+            assertEquals(Integer.valueOf(1), zkPartitionLeaders.get("test-topic-0"));
+
+            // The migrationZkVersion advances by 1, but the driver's cached version is never told.
+            // i.e. A lost acknowledgement.
+            int cachedVersionBeforeDivergence = actualMigrationZkVersion.get();
+            actualMigrationZkVersion.incrementAndGet();
+
+            // Enqueue a no-op record, this makes no changes in ZK initially, but fails when we try and update the migration state znode.
+            // This throws a MigrationClientException.
+            delta = new MetadataDelta(image);
+            delta.replay(new NoOpRecord());
+            provenance = new MetadataProvenance(110, 1, 2);
+            image = delta.apply(provenance);
+
+            CompletableFuture<Void> noOpFuture = enqueueMetadataChangeEventWithFuture(driver, delta, image, provenance);
+            ExecutionException noOpException = Assertions.assertThrows(ExecutionException.class, () -> noOpFuture.get(1, TimeUnit.MINUTES));
+            assertEquals(MigrationClientException.class, noOpException.getCause().getClass());
+
+            // MigrationClientExceptions are just logged, never escalated to the fault handler.
+            Assertions.assertNull(faultHandler.firstException());
+
+            // Enqueue a leadership change: this attempts to write to ZK, but fails again because of the mismatched versions.
+            // This time with a RuntimeException.
+            delta = new MetadataDelta(image);
+            delta.replay(new PartitionChangeRecord()
+                    .setPartitionId(0)
+                    .setTopicId(topicId)
+                    .setLeader(2));
+            provenance = new MetadataProvenance(120, 1, 3);
+            image = delta.apply(provenance);
+
+            CompletableFuture<Void> firstLeaderChangeFuture = enqueueMetadataChangeEventWithFuture(driver, delta, image, provenance);
+            ExecutionException firstLeaderChangeException = Assertions.assertThrows(ExecutionException.class, () -> firstLeaderChangeFuture.get(1, TimeUnit.MINUTES));
+            assertEquals(RuntimeException.class, firstLeaderChangeException.getCause().getClass());
+
+            // The real version is still ahead of the driver's cached version, exactly as it was before this attempt.
+            assertEquals(cachedVersionBeforeDivergence + 1, actualMigrationZkVersion.get());
+            // The stale cached version was used for the leadership change.
+            assertEquals(cachedVersionBeforeDivergence, capturedStatesAtLeaderChangeAttempts.get(0).migrationZkVersion());
+
+            // KRaft's own log is unaffected and already reflects broker 2.
+            assertEquals(2, image.topics().getTopic(topicId).partitions().get(0).leader);
+            // ZK's own content is unchanged as the write never landed.
+            assertEquals(Integer.valueOf(1), zkPartitionLeaders.get("test-topic-0"));
+            // No ZK-mode broker was ever notified of this change either.
+            assertEquals(1, metadataPropagator.images);
+            assertEquals(0, metadataPropagator.deltas);
+
+            // Unlike a failure updating just the migration state znode, this raw exception is escalated to the fault handler.
+            Assertions.assertNotNull(faultHandler.firstException());
+
+            // Enqueue a second leadership change: the driver continues to reuse the same stale cache and will fail again.
+            delta = new MetadataDelta(image);
+            delta.replay(new PartitionChangeRecord()
+                    .setPartitionId(0)
+                    .setTopicId(topicId)
+                    .setLeader(3));
+            provenance = new MetadataProvenance(130, 1, 4);
+            image = delta.apply(provenance);
+
+            CompletableFuture<Void> secondLeaderChangeFuture = enqueueMetadataChangeEventWithFuture(driver, delta, image, provenance);
+            ExecutionException secondLeaderChangeException = Assertions.assertThrows(ExecutionException.class,
+                    () -> secondLeaderChangeFuture.get(1, TimeUnit.MINUTES));
+            assertEquals(RuntimeException.class, secondLeaderChangeException.getCause().getClass());
+
+            // Confirm the exact same cached object was passed in both times.
+            assertEquals(2, capturedStatesAtLeaderChangeAttempts.size());
+            Assertions.assertSame(
+                    capturedStatesAtLeaderChangeAttempts.get(0),
+                    capturedStatesAtLeaderChangeAttempts.get(1));
+
+            // The cache is still stuck on the exact same stale version as before.
+            assertEquals(cachedVersionBeforeDivergence + 1, actualMigrationZkVersion.get());
+            assertEquals(cachedVersionBeforeDivergence, capturedStatesAtLeaderChangeAttempts.get(1).migrationZkVersion());
+
+            // KRaft has moved on again, now to broker 3.
+            assertEquals(3, image.topics().getTopic(topicId).partitions().get(0).leader);
+            // ZK's own content is now two changes behind, still broker 1.
+            assertEquals(Integer.valueOf(1), zkPartitionLeaders.get("test-topic-0"));
+            // Brokers still heard nothing at all and the gap keeps widening.
+            assertEquals(1, metadataPropagator.images);
+            assertEquals(0, metadataPropagator.deltas);
+        }
+    }
+
+    /**
+     * Shows that the dualWriteOffset (used to calculate the ZkWriteBehindLag) is not a reliable
+     * signal for a stuck write. It resets to the latest offset on every no-op delta (since handleDelta
+     * trivially succeeds for those), silently overwriting any indication that a real change in between
+     * (such as a leadership change in this test), got stuck and never made it to ZK.
+     */
+    @Test
+    public void testDualWriteOffsetUpdatesToLatestOnNoOpsWhileWriteRemainsStuck() throws Exception {
+        CountingMetadataPropagator metadataPropagator = new CountingMetadataPropagator();
+        AtomicInteger actualMigrationZkVersion = new AtomicInteger(0);
+        Map<String, Integer> zkPartitionLeaders = new HashMap<>();
+        List<ZkMigrationLeadershipState> capturedStatesAtLeaderChangeAttempts = new ArrayList<>();
+        CapturingTopicMigrationClient topicClient = newVersionCheckingTopicClient(
+                actualMigrationZkVersion, zkPartitionLeaders, capturedStatesAtLeaderChangeAttempts);
+        CapturingMigrationClient migrationClient = newVersionCheckingMigrationClient(topicClient, actualMigrationZkVersion);
+
+        MockFaultHandler faultHandler = new MockFaultHandler("testDualWriteOffsetUpdatesToLatestOnNoOpsWhileWriteRemainsStuck");
+        KRaftMigrationDriver.Builder builder = defaultTestBuilder()
+                .setPropagator(metadataPropagator)
+                .setZkMigrationClient(migrationClient)
+                .setFaultHandler(faultHandler)
+                .setInitialZkLoadHandler(metadataPublisher -> { });
+
+        try (KRaftMigrationDriver driver = builder.build()) {
+            // Setup: migrate a topic/partition to DUAL_WRITE with broker 1 as leader
+            MetadataImage image = MetadataImage.EMPTY;
+            MetadataDelta delta = new MetadataDelta(image);
+            setupDeltaForMigration(delta, true);
+
+            startAndWaitForRecoveringMigrationStateFromZK(driver);
+
+            delta.replay(ZkMigrationState.PRE_MIGRATION.toRecord().message());
+            delta.replay(zkBrokerRecord(1));
+            delta.replay(zkBrokerRecord(2));
+            delta.replay(zkBrokerRecord(3));
+            Uuid topicId = Uuid.randomUuid();
+            delta.replay(new TopicRecord().setName("test-topic").setTopicId(topicId));
+            delta.replay(new PartitionRecord()
+                    .setPartitionId(0)
+                    .setTopicId(topicId)
+                    .setReplicas(Arrays.asList(1, 2, 3))
+                    .setIsr(Arrays.asList(1, 2, 3))
+                    .setLeader(1)
+                    .setLeaderEpoch(0)
+                    .setPartitionEpoch(0));
+            MetadataProvenance provenance = new MetadataProvenance(100, 1, 1);
+            image = delta.apply(provenance);
+
+            LeaderAndEpoch newLeader = new LeaderAndEpoch(OptionalInt.of(3000), 1);
+            driver.onControllerChange(newLeader);
+            driver.onMetadataUpdate(delta, image, logDeltaManifestBuilder(provenance, newLeader).build());
+
+            TestUtils.waitForCondition(() -> driver.migrationState().get(1, TimeUnit.MINUTES).equals(MigrationDriverState.DUAL_WRITE),
+                    "Waiting for KRaftMigrationDriver to enter DUAL_WRITE state");
+
+            // The migrationZkVersion advances by 1, but the driver's cached version is never told.
+            // i.e. A lost acknowledgement.
+            actualMigrationZkVersion.incrementAndGet();
+
+            // First no-op: no content to write, so handleDelta succeeds and the metric advances
+            // to 110, even though the write to the migration state znode right after it fails.
+            delta = new MetadataDelta(image);
+            delta.replay(new NoOpRecord());
+            provenance = new MetadataProvenance(110, 1, 2);
+            image = delta.apply(provenance);
+
+            CompletableFuture<Void> firstNoOpFuture = enqueueMetadataChangeEventWithFuture(driver, delta, image, provenance);
+            ExecutionException firstNoOpException = Assertions.assertThrows(ExecutionException.class,
+                    () -> firstNoOpFuture.get(1, TimeUnit.MINUTES));
+            assertEquals(MigrationClientException.class, firstNoOpException.getCause().getClass());
+            assertEquals(110, metrics.dualWriteOffset.get());
+
+            // Leadership change: the content write itself now fails, inside handleDelta, before
+            // the metric update is ever reached, so it stays frozen at 110, not 120.
+            delta = new MetadataDelta(image);
+            delta.replay(new PartitionChangeRecord()
+                    .setPartitionId(0)
+                    .setTopicId(topicId)
+                    .setLeader(2));
+            provenance = new MetadataProvenance(120, 1, 3);
+            image = delta.apply(provenance);
+
+            CompletableFuture<Void> leaderChangeFuture = enqueueMetadataChangeEventWithFuture(driver, delta, image, provenance);
+            ExecutionException leaderChangeException = Assertions.assertThrows(ExecutionException.class,
+                    () -> leaderChangeFuture.get(1, TimeUnit.MINUTES));
+            assertEquals(RuntimeException.class, leaderChangeException.getCause().getClass());
+            assertEquals(110, metrics.dualWriteOffset.get());
+
+            // Second no-op: handleDelta succeeds again, so the metric resets to 130 (the latest offset)
+            // with no trace left of the leadership change that got stuck at 120.
+            delta = new MetadataDelta(image);
+            delta.replay(new NoOpRecord());
+            provenance = new MetadataProvenance(130, 1, 4);
+            image = delta.apply(provenance);
+
+            CompletableFuture<Void> secondNoOpFuture = enqueueMetadataChangeEventWithFuture(driver, delta, image, provenance);
+            ExecutionException secondNoOpException = Assertions.assertThrows(ExecutionException.class,
+                    () -> secondNoOpFuture.get(1, TimeUnit.MINUTES));
+            assertEquals(MigrationClientException.class, secondNoOpException.getCause().getClass());
+
+            // The metric now reports the latest offset, even though the write to ZK has been
+            // stuck this whole time and a real leadership change was silently dropped in between.
+            assertEquals(130, metrics.dualWriteOffset.get());
+        }
+    }
+
+    private CapturingTopicMigrationClient newVersionCheckingTopicClient(
+            AtomicInteger actualMigrationZkVersion,
+            Map<String, Integer> zkPartitionLeaders,
+            List<ZkMigrationLeadershipState> capturedStatesAtLeaderChangeAttempts
+    ) {
+        return new CapturingTopicMigrationClient() {
+            @Override
+            public ZkMigrationLeadershipState createTopic(
+                    String topicName,
+                    Uuid topicId,
+                    Map<Integer, PartitionRegistration> topicPartitions,
+                    ZkMigrationLeadershipState state
+            ) {
+                topicPartitions.forEach((partitionId, registration) ->
+                        zkPartitionLeaders.put(topicName + "-" + partitionId, registration.leader));
+                return super.createTopic(topicName, topicId, topicPartitions, state);
+            }
+
+            @Override
+            public ZkMigrationLeadershipState updateTopicPartitions(
+                    Map<String, Map<Integer, PartitionRegistration>> topicPartitions,
+                    ZkMigrationLeadershipState state
+            ) {
+                capturedStatesAtLeaderChangeAttempts.add(state);
+                if (state.migrationZkVersion() != actualMigrationZkVersion.get()) {
+                    throw new RuntimeException("Conditional update on KRaft Migration ZNode failed. Sent zkVersion = " +
+                            state.migrationZkVersion() + ". The failed write was: " + state +
+                            ". This indicates that another KRaft controller is making writes to ZooKeeper.");
+                }
+                topicPartitions.forEach((topicName, partitionMap) -> partitionMap.forEach((partitionId, registration) ->
+                        zkPartitionLeaders.put(topicName + "-" + partitionId, registration.leader)));
+                ZkMigrationLeadershipState newState = state.withMigrationZkVersion(actualMigrationZkVersion.incrementAndGet());
+                return super.updateTopicPartitions(topicPartitions, newState);
+            }
+        };
+    }
+
+    private CapturingMigrationClient newVersionCheckingMigrationClient(
+            CapturingTopicMigrationClient topicClient,
+            AtomicInteger actualMigrationZkVersion
+    ) {
+        return new CapturingMigrationClient(
+                new HashSet<>(Arrays.asList(1, 2, 3)),
+                topicClient,
+                new CapturingConfigMigrationClient(),
+                new CapturingAclMigrationClient(),
+                new CapturingDelegationTokenMigrationClient(),
+                CapturingMigrationClient.EMPTY_BATCH_SUPPLIER
+        ) {
+            @Override
+            public ZkMigrationLeadershipState setMigrationRecoveryState(ZkMigrationLeadershipState state) {
+                if (state.migrationZkVersion() != -1 && state.migrationZkVersion() != actualMigrationZkVersion.get()) {
+                    throw new MigrationClientException("KeeperErrorCode = BadVersion for /migration");
+                }
+                ZkMigrationLeadershipState newState = state.withMigrationZkVersion(actualMigrationZkVersion.incrementAndGet());
+                return super.setMigrationRecoveryState(newState);
+            }
+        };
     }
 
     private void setupDeltaForMigration(
